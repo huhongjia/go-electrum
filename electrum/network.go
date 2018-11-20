@@ -7,16 +7,17 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-const (
-	ClientVersion   = "0.0.1"
-	ProtocolVersion = "1.0"
-)
+const delim = byte('\n')
 
 var (
 	ErrNotImplemented = errors.New("not implemented")
 	ErrNodeConnected  = errors.New("node already connected")
+	ErrNodeShutdown   = errors.New("node has shutdown")
+	ErrTimeout        = errors.New("request timeout")
 )
 
 type Transport interface {
@@ -25,41 +26,65 @@ type Transport interface {
 	Errors() <-chan error
 }
 
-type respMetadata struct {
-	Id     int    `json:"id"`
-	Method string `json:"method"`
-	Error  string `json:"error"`
+type response struct {
+	Id     uint64  `json:"id"`
+	Method string  `json:"method"`
+	Error  *APIErr `json:"error"`
+}
+
+type APIErr struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *APIErr) Error() string {
+	return fmt.Sprintf("errorNo: %d, errMsg: %s", e.Code, e.Message)
 }
 
 type request struct {
-	Id     int      `json:"id"`
-	Method string   `json:"method"`
-	Params []string `json:"params"`
+	Id     uint64        `json:"id"`
+	Method string        `json:"method"`
+	Params []interface{} `json:"params"`
 }
 
 type basicResp struct {
 	Result string `json:"result"`
 }
 
+type container struct {
+	content []byte
+	err     error
+}
+
 type Node struct {
-	Address string
+	transport Transport
 
-	transport    Transport
-	handlers     map[int]chan []byte
 	handlersLock sync.RWMutex
+	handlers     map[uint64]chan *container
 
-	pushHandlers     map[string][]chan []byte
 	pushHandlersLock sync.RWMutex
+	pushHandlers     map[string][]chan *container
 
-	nextId int
+	Error chan error
+	quit  chan struct{}
+
+	// nextId tags a request, and get the same id from server result.
+	// Should be atomic operation for concurrence.
+	// notice the max request limit, if reach to the max times,
+	// 0 will be the next id. Assume the oldest has been deal completely.
+	nextId uint64
 }
 
 // NewNode creates a new node.
 func NewNode() *Node {
 	n := &Node{
-		handlers:     make(map[int]chan []byte),
-		pushHandlers: make(map[string][]chan []byte),
+		handlers:     make(map[uint64]chan *container),
+		pushHandlers: make(map[string][]chan *container),
+
+		Error: make(chan error),
+		quit:  make(chan struct{}),
 	}
+
 	return n
 }
 
@@ -68,13 +93,14 @@ func (n *Node) ConnectTCP(addr string) error {
 	if n.transport != nil {
 		return ErrNodeConnected
 	}
-	n.Address = addr
+
 	transport, err := NewTCPTransport(addr)
 	if err != nil {
 		return err
 	}
 	n.transport = transport
 	go n.listen()
+
 	return nil
 }
 
@@ -83,20 +109,14 @@ func (n *Node) ConnectSSL(addr string, config *tls.Config) error {
 	if n.transport != nil {
 		return ErrNodeConnected
 	}
-	n.Address = addr
 	transport, err := NewSSLTransport(addr, config)
 	if err != nil {
 		return err
 	}
 	n.transport = transport
 	go n.listen()
-	return nil
-}
 
-// err handles errors produced by the foreign node.
-func (n *Node) err(err error) {
-	// TODO (d4l3k) Better error handling.
-	log.Fatal(err)
+	return nil
 }
 
 // listen processes messages from the server.
@@ -104,18 +124,25 @@ func (n *Node) listen() {
 	for {
 		select {
 		case err := <-n.transport.Errors():
-			n.err(err)
-			return
+			n.Error <- err
+			n.shutdown()
 		case bytes := <-n.transport.Responses():
-			msg := &respMetadata{}
+			result := &container{
+				content: bytes,
+			}
+
+			msg := &response{}
 			if err := json.Unmarshal(bytes, msg); err != nil {
-				n.err(err)
-				return
+				if DebugMode {
+					log.Printf("unmarshal received message failed: %v", err)
+				}
+
+				result.err = fmt.Errorf("unmarshal received message failed: %v", err)
+			} else if msg.Error != nil {
+				result.err = msg.Error
 			}
-			if len(msg.Error) > 0 {
-				n.err(fmt.Errorf("error from server: %#v", msg.Error))
-				return
-			}
+
+			// subscribe message if returned message with 'method' field
 			if len(msg.Method) > 0 {
 				n.pushHandlersLock.RLock()
 				handlers := n.pushHandlers[msg.Method]
@@ -123,7 +150,7 @@ func (n *Node) listen() {
 
 				for _, handler := range handlers {
 					select {
-					case handler <- bytes:
+					case handler <- result:
 					default:
 					}
 				}
@@ -134,29 +161,35 @@ func (n *Node) listen() {
 			n.handlersLock.RUnlock()
 
 			if ok {
-				c <- bytes
+				c <- result
 			}
 		}
 	}
 }
 
 // listenPush returns a channel of messages matching the method.
-func (n *Node) listenPush(method string) <-chan []byte {
-	c := make(chan []byte, 1)
+func (n *Node) listenPush(method string) <-chan *container {
+	c := make(chan *container, 1)
 	n.pushHandlersLock.Lock()
-	defer n.pushHandlersLock.Unlock()
 	n.pushHandlers[method] = append(n.pushHandlers[method], c)
+	n.pushHandlersLock.Unlock()
+
 	return c
 }
 
 // request makes a request to the server and unmarshals the response into v.
-func (n *Node) request(method string, params []string, v interface{}) error {
+func (n *Node) request(method string, params []interface{}, v interface{}) error {
+	select {
+	case <-n.quit:
+		return ErrNodeShutdown
+	default:
+	}
+
 	msg := request{
-		Id:     n.nextId,
+		Id:     atomic.AddUint64(&n.nextId, 1),
 		Method: method,
 		Params: params,
 	}
-	n.nextId++
 	bytes, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -166,20 +199,41 @@ func (n *Node) request(method string, params []string, v interface{}) error {
 		return err
 	}
 
-	c := make(chan []byte, 1)
+	c := make(chan *container, 1)
 
 	n.handlersLock.Lock()
 	n.handlers[msg.Id] = c
 	n.handlersLock.Unlock()
 
-	resp := <-c
+	var resp *container
+	select {
+	case resp = <-c:
+	case <-time.After(5 * time.Second):
+		return ErrTimeout
+	}
+
+	if resp.err != nil {
+		return resp.err
+	}
 
 	n.handlersLock.Lock()
-	defer n.handlersLock.Unlock()
 	delete(n.handlers, msg.Id)
+	n.handlersLock.Unlock()
 
-	if err := json.Unmarshal(resp, v); err != nil {
-		return nil
+	if v != nil {
+		err = json.Unmarshal(resp.content, v)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
+}
+
+func (n *Node) shutdown() {
+	close(n.quit)
+
+	n.transport = nil
+	n.handlers = nil
+	n.pushHandlers = nil
 }

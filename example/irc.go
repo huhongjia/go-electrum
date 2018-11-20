@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/d4l3k/go-electrum/irc"
+	"github.com/copernet/go-electrum/irc"
 )
 
 func main() {
