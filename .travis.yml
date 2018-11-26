@@ -1,16 +1,8 @@
 sudo: required
 language: go
 go:
-- "1.10.x"
-services:
-- docker
+  - "1.10.x"
 
-before_install:
-- docker build -t go-electrum .
-- docker run -it -d --name go-electrum -e TRAVIS_JOB_ID="$TRAVIS_JOB_ID" -e TRAVIS_BRANCH="$TRAVIS_BRANCH" go-electrum
-script:
-- docker exec go-electrum /bin/bash -c 'cd /go/src/github.com/huhongjia/go-electrum/electrum && go build'
-notifications:
-  email:
-    on_success: change
-    on_failure: alwayss
+install:
+  - echo $GOPATH
+  - cd electrum && go build
