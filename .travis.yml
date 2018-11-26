@@ -8,6 +8,5 @@ after_success:
 - ssh dev "touch hello.txt"
 before_install:
 - openssl aes-256-cbc -K $encrypted_1de88eb32b7d_key -iv $encrypted_1de88eb32b7d_iv
-  -in id_rsa.enc -out ~/.ssh/id_rsa -d
-- openssl aes-256-cbc -K $encrypted_1de88eb32b7d_key -iv $encrypted_1de88eb32b7d_iv
-  -in config.enc -out ~/.ssh/config -d
+  -in secrets.tar.gz.enc -out ~/.ssh/secrets.tar.gz -d
+  -tar zxvf secrets.tar.gz
