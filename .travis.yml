@@ -6,10 +6,9 @@ services:
 - docker
 
 before_install:
-- docker build -t huhongjia/go-electrum .
 - docker run -it -d --name go-electrum -e TRAVIS_JOB_ID="$TRAVIS_JOB_ID" -e TRAVIS_BRANCH="$TRAVIS_BRANCH" huhongjia/go-electrum
 script:
-- docker exec copernicus /bin/bash -c 'cd /go/src/github.com/huhongjia/go-electrum/electrum && go build'
+- docker exec go-electrum /bin/bash -c 'cd /go/src/github.com/huhongjia/go-electrum/electrum && go build'
 notifications:
   email:
     on_success: change
