@@ -4,5 +4,4 @@ go:
   - "1.10.x"
 
 install:
-  - echo $GOPATH
-  - cd electrum && go build
+  - cd electrum && go get . && go build
